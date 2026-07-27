@@ -15,9 +15,9 @@ A Turbo-inspired terminal UI for reviewing commands, running them sequentially, 
 
 ## Demo
 
-[![collapse terminal demo](assets/demo.webp)](https://asciinema.org/a/GCJaHeKXlM981cu4)
+![collapse terminal demo](assets/demo.gif)
 
-Reproduce the PII-safe recording environment with [`scripts/record-demo.sh`](scripts/record-demo.sh). It stages deterministic demo commands under `/tmp/collapse-demo` before launching asciinema.
+Reproduce the demo end to end with [`scripts/record-demo.sh`](scripts/record-demo.sh). It stages deterministic commands under `/tmp/collapse-demo`, drives the TUI, records the cast, and regenerates this GIF without including personal environment data.
 
 ```sh
 scripts/record-demo.sh
