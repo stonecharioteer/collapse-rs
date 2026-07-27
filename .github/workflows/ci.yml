@@ -47,3 +47,21 @@ jobs:
 
       - name: Check Markdown formatting
         run: npx --yes prettier@3.9.6 --check "**/*.md"
+
+  macos-install:
+    name: Install and launch on macOS
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install release binary
+        run: cargo install --path . --root "$RUNNER_TEMP/collapse-install" --locked
+
+      - name: Verify code signature and launch
+        run: |
+          codesign --verify --strict --verbose=2 "$RUNNER_TEMP/collapse-install/bin/collapse"
+          "$RUNNER_TEMP/collapse-install/bin/collapse" --version
