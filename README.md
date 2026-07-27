@@ -1,6 +1,9 @@
 # collapse
 
-A Turbo-inspired terminal UI for reviewing commands, running them sequentially, and keeping every command's output easy to inspect.
+`collapse` turns a sequence of shell commandns into an organized, reviewable workflow. Edit and reorder
+commands before running, decide which steps are required, and inspect each result in its own searchable tab.
+
+I whipped this up while working on a complex project that required me to daisy chain a bunch of commands frequently, and I wanted to inspect the previous commands' logs to determine the failure downstream.
 
 ```text
                          █
