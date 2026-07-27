@@ -209,6 +209,7 @@ fn shell_command(command_line: &str) -> CommandBuilder {
     let mut command = CommandBuilder::new("/bin/sh");
     command.arg("-c");
     command.arg(command_line);
+    inherit_current_directory(&mut command);
     command
 }
 
@@ -217,7 +218,14 @@ fn shell_command(command_line: &str) -> CommandBuilder {
     let mut command = CommandBuilder::new("cmd");
     command.arg("/C");
     command.arg(command_line);
+    inherit_current_directory(&mut command);
     command
+}
+
+fn inherit_current_directory(command: &mut CommandBuilder) {
+    if let Ok(directory) = std::env::current_dir() {
+        command.cwd(directory);
+    }
 }
 
 fn configure_color(command: &mut CommandBuilder, color: ColorMode) {
@@ -252,6 +260,16 @@ mod tests {
         rows: 24,
         cols: 100,
     };
+
+    #[test]
+    fn commands_inherit_the_launch_directory() {
+        let expected = std::env::current_dir().unwrap();
+        let command = shell_command("true");
+        assert_eq!(
+            command.get_cwd().map(std::path::PathBuf::from),
+            Some(expected)
+        );
+    }
 
     #[test]
     fn runs_commands_in_order_and_captures_output() {
