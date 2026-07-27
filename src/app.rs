@@ -21,7 +21,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Gauge, Padding, Paragraph, Tabs},
 };
 
-use crate::runner::{self, ColorMode, CommandResult, Event};
+use crate::runner::{self, ColorMode, CommandResult, Event, TerminalSize};
 
 const CYAN: Color = Color::Rgb(0, 229, 255);
 const MAGENTA: Color = Color::Rgb(255, 73, 219);
@@ -38,11 +38,18 @@ pub fn run(
     let Some(command_lines) = crate::editor::review(terminal, command_lines)? else {
         return Ok(0);
     };
-    let mut app = App::new(command_lines.clone());
+    let screen = terminal.size()?;
+    let terminal_size = TerminalSize {
+        rows: screen.height.saturating_sub(8).max(4),
+        cols: screen.width.saturating_sub(4).max(20),
+    };
+    let mut app = App::new(command_lines.clone(), terminal_size);
     let (sender, receiver) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
-    let worker = thread::spawn(move || runner::run(command_lines, color, sender, worker_cancel));
+    let worker = thread::spawn(move || {
+        runner::run(command_lines, color, terminal_size, sender, worker_cancel);
+    });
     let mut interrupted = false;
 
     let ui_result = (|| -> io::Result<()> {
@@ -104,9 +111,12 @@ struct App {
 }
 
 impl App {
-    fn new(commands: Vec<String>) -> Self {
+    fn new(commands: Vec<String>, terminal_size: TerminalSize) -> Self {
         Self {
-            tasks: commands.into_iter().map(Task::new).collect(),
+            tasks: commands
+                .into_iter()
+                .map(|command| Task::new(command, terminal_size))
+                .collect(),
             selected: 0,
             selection_pinned: false,
             all_finished: false,
@@ -138,8 +148,7 @@ impl App {
                 }
                 Event::Output { index, bytes } => {
                     if let Some(task) = self.tasks.get_mut(index) {
-                        task.raw_output.extend(bytes);
-                        task.output_dirty = true;
+                        task.push_output(&bytes);
                     }
                 }
                 Event::Finished {
@@ -151,14 +160,21 @@ impl App {
                         task.elapsed = Some(elapsed);
                         task.started_at = None;
                         task.status = match result {
-                            CommandResult::Exited(status) if status.success() => TaskStatus::Passed,
-                            CommandResult::Exited(status) => TaskStatus::Failed(status.code()),
+                            CommandResult::Exited {
+                                code: 0,
+                                signal: None,
+                            } => TaskStatus::Passed,
+                            CommandResult::Exited { code, signal: None } => {
+                                TaskStatus::Failed(Some(code as i32))
+                            }
+                            CommandResult::Exited {
+                                signal: Some(_), ..
+                            } => TaskStatus::Failed(None),
                             CommandResult::Cancelled => TaskStatus::Cancelled,
                             CommandResult::SpawnFailed(error) => {
-                                task.raw_output.extend_from_slice(
+                                task.push_output(
                                     format!("\n\x1b[31mcollapse: {error}\x1b[0m\n").as_bytes(),
                                 );
-                                task.output_dirty = true;
                                 TaskStatus::SpawnFailed
                             }
                         };
@@ -716,12 +732,54 @@ fn highlight_matches(
     highlighted
 }
 
+fn terminal_history(parser: &mut vt100::Parser) -> Text<'static> {
+    let (rows, cols) = parser.screen().size();
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let scrollback_len = parser.screen().scrollback();
+    let mut lines = Vec::with_capacity(scrollback_len + usize::from(rows));
+
+    for start in (0..scrollback_len).step_by(usize::from(rows)) {
+        parser
+            .screen_mut()
+            .set_scrollback(scrollback_len.saturating_sub(start));
+        let count = usize::from(rows).min(scrollback_len - start);
+        let formatted_rows = parser
+            .screen()
+            .rows_formatted(0, cols)
+            .take(count)
+            .collect::<Vec<_>>();
+        lines.extend(formatted_rows.into_iter().map(terminal_row));
+    }
+
+    parser.screen_mut().set_scrollback(0);
+    let current_rows = parser.screen().rows_formatted(0, cols).collect::<Vec<_>>();
+    lines.extend(current_rows.into_iter().map(terminal_row));
+    while lines.last().is_some_and(line_is_blank) {
+        lines.pop();
+    }
+    let leading_blank_lines = lines.iter().take_while(|line| line_is_blank(line)).count();
+    lines.drain(..leading_blank_lines);
+    Text::from(lines)
+}
+
+fn terminal_row(bytes: Vec<u8>) -> Line<'static> {
+    bytes
+        .into_text()
+        .ok()
+        .and_then(|text| text.lines.into_iter().next())
+        .unwrap_or_else(|| Line::raw(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|span| span.content.trim().is_empty())
+}
+
 struct Task {
     command: String,
     status: TaskStatus,
     started_at: Option<Instant>,
     elapsed: Option<Duration>,
-    raw_output: Vec<u8>,
+    terminal: vt100::Parser,
     rendered: Text<'static>,
     output_dirty: bool,
     scroll: usize,
@@ -729,13 +787,13 @@ struct Task {
 }
 
 impl Task {
-    fn new(command: String) -> Self {
+    fn new(command: String, terminal_size: TerminalSize) -> Self {
         Self {
             command,
             status: TaskStatus::Queued,
             started_at: None,
             elapsed: None,
-            raw_output: Vec::new(),
+            terminal: vt100::Parser::new(terminal_size.rows, terminal_size.cols, 10_000),
             rendered: Text::default(),
             output_dirty: false,
             scroll: 0,
@@ -743,14 +801,16 @@ impl Task {
         }
     }
 
+    fn push_output(&mut self, bytes: &[u8]) {
+        self.terminal.process(bytes);
+        self.output_dirty = true;
+    }
+
     fn refresh_output(&mut self) {
         if !self.output_dirty {
             return;
         }
-        self.rendered = self
-            .raw_output
-            .into_text()
-            .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(&self.raw_output).into_owned()));
+        self.rendered = terminal_history(&mut self.terminal);
         self.output_dirty = false;
     }
 
@@ -851,11 +911,12 @@ mod tests {
     use super::*;
     use ratatui::style::Color;
 
+    const TEST_TERMINAL: TerminalSize = TerminalSize { rows: 8, cols: 80 };
+
     #[test]
     fn ansi_output_keeps_truecolor() {
-        let mut task = Task::new("colors".into());
-        task.raw_output = b"\x1b[38;2;12;34;56mhello\x1b[0m\n".to_vec();
-        task.output_dirty = true;
+        let mut task = Task::new("colors".into(), TEST_TERMINAL);
+        task.push_output(b"\x1b[38;2;12;34;56mhello\x1b[0m\n");
         task.refresh_output();
 
         assert_eq!(task.rendered.lines[0].spans[0].content, "hello");
@@ -863,6 +924,38 @@ mod tests {
             task.rendered.lines[0].spans[0].style.fg,
             Some(Color::Rgb(12, 34, 56))
         );
+    }
+
+    #[test]
+    fn terminal_output_rewrites_progress_in_place() {
+        let mut task = Task::new("progress".into(), TEST_TERMINAL);
+        task.push_output(b"progress 0/2");
+        task.push_output(b"\r\x1b[2Kprogress 1/2");
+        task.refresh_output();
+
+        let output = task.rendered.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(output, "progress 1/2");
+    }
+
+    #[test]
+    fn terminal_scrollback_is_kept() {
+        let size = TerminalSize { rows: 3, cols: 40 };
+        let mut task = Task::new("lines".into(), size);
+        task.push_output(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        task.refresh_output();
+
+        let output = task
+            .rendered
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(output, ["one", "two", "three", "four", "five"]);
     }
 
     #[test]
@@ -887,7 +980,7 @@ mod tests {
 
     #[test]
     fn next_match_wraps_around() {
-        let mut app = App::new(vec!["search".into()]);
+        let mut app = App::new(vec!["search".into()], TEST_TERMINAL);
         app.tasks[0].rendered = Text::from("needle\nother\nneedle");
         app.search_query = "needle".into();
         app.select_initial_match();
@@ -901,7 +994,7 @@ mod tests {
 
     #[test]
     fn quitting_requires_confirmation() {
-        let mut app = App::new(vec!["work".into()]);
+        let mut app = App::new(vec!["work".into()], TEST_TERMINAL);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE,)));
         assert!(app.quit_confirmation);
 

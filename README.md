@@ -23,7 +23,7 @@ collapse 'cargo test' 'cargo clippy --all-targets' 'cargo build --release'
 
 Every invocation opens a command editor before anything runs. Review, add, remove, edit, or reorder commands, then explicitly confirm the queue. Running `collapse` without arguments opens an empty editor.
 
-Once confirmed, `collapse` captures stdout and stderr and gives every command its own tab. ANSI styling is translated into Ratatui styles, including 16-color, 256-color, and 24-bit truecolor output. Press `/` to search the selected task's output with Vim-style match navigation.
+Once confirmed, `collapse` runs every command in an isolated pseudo-terminal, captures its output, and gives it a dedicated tab. Terminal-aware programs therefore retain spinners, in-place progress bars, and color detection. ANSI styling is translated into Ratatui styles, including 16-color, 256-color, and 24-bit truecolor output. Press `/` to search the selected task's output with Vim-style match navigation.
 
 ## Install
 

@@ -1,6 +1,5 @@
 use std::{
     io::Read,
-    process::{Command, ExitStatus, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -10,11 +9,30 @@ use std::{
     time::{Duration, Instant},
 };
 
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorMode {
     Always,
     Auto,
     Never,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalSize {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl TerminalSize {
+    fn as_pty_size(self) -> PtySize {
+        PtySize {
+            rows: self.rows,
+            cols: self.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -38,7 +56,7 @@ pub enum Event {
 
 #[derive(Debug)]
 pub enum CommandResult {
-    Exited(ExitStatus),
+    Exited { code: u32, signal: Option<String> },
     SpawnFailed(String),
     Cancelled,
 }
@@ -46,6 +64,7 @@ pub enum CommandResult {
 pub fn run(
     commands: Vec<String>,
     color: ColorMode,
+    terminal_size: TerminalSize,
     sender: Sender<Event>,
     cancel: Arc<AtomicBool>,
 ) {
@@ -57,39 +76,43 @@ pub fn run(
         let started_at = Instant::now();
         let _ = sender.send(Event::Started { index });
 
-        let mut command = shell_command(&command_line);
-        configure_color(&mut command, color);
-        // collapse owns the terminal for navigation. Letting a child read that terminal while it
-        // lives in a separate process group can suspend it with SIGTTIN and stall the whole queue.
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        let pty_system = native_pty_system();
+        let pair = match pty_system.openpty(terminal_size.as_pty_size()) {
+            Ok(pair) => pair,
             Err(error) => {
-                let _ = sender.send(Event::Finished {
-                    index,
-                    result: CommandResult::SpawnFailed(error.to_string()),
-                    elapsed: started_at.elapsed(),
-                });
+                send_spawn_failure(&sender, index, started_at, error.to_string());
+                continue;
+            }
+        };
+        let reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                send_spawn_failure(&sender, index, started_at, error.to_string());
                 continue;
             }
         };
 
-        let stdout_reader = child
-            .stdout
-            .take()
-            .map(|stdout| pipe_reader(stdout, index, sender.clone()));
-        let stderr_reader = child
-            .stderr
-            .take()
-            .map(|stderr| pipe_reader(stderr, index, sender.clone()));
+        let mut command = shell_command(&command_line);
+        configure_color(&mut command, color);
+        let mut child = match pair.slave.spawn_command(command) {
+            Ok(child) => child,
+            Err(error) => {
+                send_spawn_failure(&sender, index, started_at, error.to_string());
+                continue;
+            }
+        };
+        drop(pair.slave);
+
+        // Children see a real terminal, which lets progress bars and color detection work. collapse
+        // does not forward interactive input, so close the writable side after spawning.
+        if let Ok(writer) = pair.master.take_writer() {
+            drop(writer);
+        }
+        let output_reader = pipe_reader(reader, index, sender.clone());
 
         let (status, was_cancelled) = loop {
             if cancel.load(Ordering::Relaxed) {
-                terminate(&mut child);
+                let _ = child.kill();
                 break (child.wait().ok(), true);
             }
 
@@ -100,17 +123,15 @@ pub fn run(
             }
         };
 
-        if let Some(reader) = stdout_reader {
-            reader.finish();
-        }
-        if let Some(reader) = stderr_reader {
-            reader.finish();
-        }
+        output_reader.finish();
 
         let result = if was_cancelled {
             CommandResult::Cancelled
         } else if let Some(status) = status {
-            CommandResult::Exited(status)
+            CommandResult::Exited {
+                code: status.exit_code(),
+                signal: status.signal().map(str::to_owned),
+            }
         } else {
             CommandResult::SpawnFailed("could not read the command's exit status".into())
         };
@@ -131,6 +152,14 @@ pub fn run(
     });
 }
 
+fn send_spawn_failure(sender: &Sender<Event>, index: usize, started_at: Instant, error: String) {
+    let _ = sender.send(Event::Finished {
+        index,
+        result: CommandResult::SpawnFailed(error),
+        elapsed: started_at.elapsed(),
+    });
+}
+
 struct PipeReader {
     handle: thread::JoinHandle<()>,
     done: Receiver<()>,
@@ -138,9 +167,8 @@ struct PipeReader {
 
 impl PipeReader {
     fn finish(self) {
-        // Some commands start daemons that accidentally retain the stdout/stderr pipe. Waiting
-        // forever for EOF would prevent the next command from starting, even though the command
-        // itself has exited. Give the reader time to drain normal buffered output, then detach it.
+        // Some commands start daemons that accidentally retain the terminal. Waiting forever for
+        // EOF would prevent the next command from starting, even though the command itself exited.
         if self.done.recv_timeout(Duration::from_millis(250)).is_ok() {
             let _ = self.handle.join();
         }
@@ -177,41 +205,22 @@ fn pipe_reader<R: Read + Send + 'static>(
 }
 
 #[cfg(unix)]
-fn shell_command(command_line: &str) -> Command {
-    use std::os::unix::process::CommandExt as _;
-
-    let mut command = Command::new("/bin/sh");
-    command.arg("-c").arg(command_line).process_group(0);
+fn shell_command(command_line: &str) -> CommandBuilder {
+    let mut command = CommandBuilder::new("/bin/sh");
+    command.arg("-c");
+    command.arg(command_line);
     command
 }
 
 #[cfg(windows)]
-fn shell_command(command_line: &str) -> Command {
-    let mut command = Command::new("cmd");
-    command.arg("/C").arg(command_line);
+fn shell_command(command_line: &str) -> CommandBuilder {
+    let mut command = CommandBuilder::new("cmd");
+    command.arg("/C");
+    command.arg(command_line);
     command
 }
 
-#[cfg(unix)]
-fn terminate(child: &mut std::process::Child) {
-    // The shell starts in its own process group, so a negative PID kills its whole command tree.
-    // SAFETY: `kill` accepts any process-group ID; failure (including a stale PID) is harmless here.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-}
-
-#[cfg(windows)]
-fn terminate(child: &mut std::process::Child) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &child.id().to_string(), "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = child.kill();
-}
-
-fn configure_color(command: &mut Command, color: ColorMode) {
+fn configure_color(command: &mut CommandBuilder, color: ColorMode) {
     match color {
         ColorMode::Always => {
             command.env_remove("NO_COLOR");
@@ -239,12 +248,18 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    const TEST_TERMINAL: TerminalSize = TerminalSize {
+        rows: 24,
+        cols: 100,
+    };
+
     #[test]
     fn runs_commands_in_order_and_captures_output() {
         let (sender, receiver) = mpsc::channel();
         run(
             vec!["printf first".into(), "printf second".into()],
             ColorMode::Auto,
+            TEST_TERMINAL,
             sender,
             Arc::new(AtomicBool::new(false)),
         );
@@ -267,20 +282,48 @@ mod tests {
             .copied()
             .collect();
 
+        let mut terminal = vt100::Parser::new(24, 100, 100);
+        terminal.process(&output);
+        let rendered = terminal.screen().contents();
+
         assert_eq!(starts, [0, 1]);
-        assert_eq!(String::from_utf8(output).unwrap(), "firstsecond");
+        assert!(rendered.contains("first"));
+        assert!(rendered.contains("second"));
         assert!(matches!(events.last(), Some(Event::AllFinished { .. })));
+    }
+
+    #[test]
+    fn child_detects_a_terminal() {
+        let (sender, receiver) = mpsc::channel();
+        run(
+            vec!["if [ -t 2 ]; then printf tty; fi".into()],
+            ColorMode::Auto,
+            TEST_TERMINAL,
+            sender,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let output = receiver
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Output { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert!(String::from_utf8_lossy(&output).contains("tty"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn advances_when_a_background_process_retains_the_output_pipes() {
+    fn advances_when_a_background_process_retains_the_terminal() {
         let (sender, receiver) = mpsc::channel();
         let started_at = Instant::now();
         let worker = thread::spawn(move || {
             run(
                 vec!["sleep 3 & printf first".into(), "printf second".into()],
                 ColorMode::Auto,
+                TEST_TERMINAL,
                 sender,
                 Arc::new(AtomicBool::new(false)),
             );
@@ -300,7 +343,7 @@ mod tests {
 
         assert!(
             second_started,
-            "the retained pipe blocked the next command from starting"
+            "the retained terminal blocked the next command from starting"
         );
     }
 
@@ -313,6 +356,7 @@ mod tests {
             run(
                 vec![long_running_command().into()],
                 ColorMode::Auto,
+                TEST_TERMINAL,
                 sender,
                 worker_cancel,
             );
