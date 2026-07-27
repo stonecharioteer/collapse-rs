@@ -84,6 +84,7 @@ pub fn run(
                 continue;
             }
         };
+        suppress_input_echo(pair.master.as_ref());
         let reader = match pair.master.try_clone_reader() {
             Ok(reader) => reader,
             Err(error) => {
@@ -151,6 +152,26 @@ pub fn run(
         cancelled: cancel.load(Ordering::Relaxed),
     });
 }
+
+#[cfg(unix)]
+fn suppress_input_echo(master: &dyn portable_pty::MasterPty) {
+    let Some(file_descriptor) = master.as_raw_fd() else {
+        return;
+    };
+    // Dropping portable-pty's writer sends a newline and the terminal's EOF character. Disable
+    // input echo first so those control bytes do not briefly appear as `^D` in captured output.
+    // SAFETY: the descriptor belongs to the live PTY master, and both calls only access `attributes`.
+    unsafe {
+        let mut attributes = std::mem::zeroed();
+        if libc::tcgetattr(file_descriptor, &mut attributes) == 0 {
+            attributes.c_lflag &= !(libc::ECHO | libc::ECHONL);
+            let _ = libc::tcsetattr(file_descriptor, libc::TCSANOW, &attributes);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn suppress_input_echo(_master: &dyn portable_pty::MasterPty) {}
 
 fn send_spawn_failure(sender: &Sender<Event>, index: usize, started_at: Instant, error: String) {
     let _ = sender.send(Event::Finished {
@@ -305,6 +326,7 @@ mod tests {
         let rendered = terminal.screen().contents();
 
         assert_eq!(starts, [0, 1]);
+        assert!(!String::from_utf8_lossy(&output).contains("^D"));
         assert!(rendered.contains("first"));
         assert!(rendered.contains("second"));
         assert!(matches!(events.last(), Some(Event::AllFinished { .. })));

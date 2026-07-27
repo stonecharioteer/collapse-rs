@@ -184,6 +184,7 @@ dependencies = [
  "ansi-to-tui",
  "clap",
  "crossterm",
+ "libc",
  "portable-pty",
  "ratatui",
  "vt100",
