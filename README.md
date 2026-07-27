@@ -17,6 +17,12 @@ A Turbo-inspired terminal UI for reviewing commands, running them sequentially, 
 
 [![collapse terminal demo](assets/demo.webp)](https://asciinema.org/a/GCJaHeKXlM981cu4)
 
+Reproduce the PII-safe recording environment with [`scripts/record-demo.sh`](scripts/record-demo.sh). It stages deterministic demo commands under `/tmp/collapse-demo` before launching asciinema.
+
+```sh
+scripts/record-demo.sh
+```
+
 ```sh
 collapse 'cargo test' 'cargo clippy --all-targets' 'cargo build --release'
 ```
