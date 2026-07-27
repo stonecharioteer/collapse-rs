@@ -15,7 +15,7 @@ A Turbo-inspired terminal UI for reviewing commands, running them sequentially, 
 
 ## Demo
 
-[![collapse terminal demo](https://asciinema.org/a/GCJaHeKXlM981cu4.svg)](https://asciinema.org/a/GCJaHeKXlM981cu4)
+[![collapse terminal demo](assets/demo.webp)](https://asciinema.org/a/GCJaHeKXlM981cu4)
 
 ```sh
 collapse 'cargo test' 'cargo clippy --all-targets' 'cargo build --release'
