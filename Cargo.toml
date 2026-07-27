@@ -1,0 +1,35 @@
+[package]
+name = "collapse-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Run commands sequentially and browse their output in a terminal UI"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/stonecharioteer/collapse-rs"
+homepage = "https://github.com/stonecharioteer/collapse-rs"
+rust-version = "1.88"
+keywords = ["cli", "ratatui", "terminal", "commands", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "collapse"
+path = "src/main.rs"
+
+[dependencies]
+ansi-to-tui = "8.0.1"
+clap = { version = "4.6.4", features = ["derive"] }
+crossterm = "0.29.0"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/collapse-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+disabled-strategies = ["quick-install"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
