@@ -21,13 +21,16 @@ DEADLINE_SECONDS = 20
 # Times are relative to process start. The recording starts before collapse, so its animated logo
 # is included. Escape-[Z is Shift-Tab in a terminal.
 ACTIONS = [
-    (1.55, b"r"),
-    (1.85, b"y"),
-    (10.00, b"\x1b[Z"),
-    (10.35, b"/test\r"),
-    (10.85, b"n"),
-    (11.70, b"q"),
-    (12.00, b"y"),
+    # Let the launch animation finish, then mark the final task optional before running.
+    (2.20, b"jjj"),
+    (2.55, b" "),
+    (2.95, b"r"),
+    (3.25, b"y"),
+    (11.20, b"\x1b[Z"),
+    (11.55, b"/test\r"),
+    (12.05, b"n"),
+    (12.90, b"q"),
+    (13.20, b"y"),
 ]
 
 COMMAND = [

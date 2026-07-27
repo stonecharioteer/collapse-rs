@@ -11,6 +11,21 @@ use std::{
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandSpec {
+    pub command: String,
+    pub required: bool,
+}
+
+impl CommandSpec {
+    pub fn required(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            required: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorMode {
     Always,
@@ -49,6 +64,10 @@ pub enum Event {
         result: CommandResult,
         elapsed: Duration,
     },
+    Skipped {
+        index: usize,
+        blocked_by: usize,
+    },
     AllFinished {
         cancelled: bool,
     },
@@ -61,14 +80,27 @@ pub enum CommandResult {
     Cancelled,
 }
 
+impl CommandResult {
+    fn is_failure(&self) -> bool {
+        !matches!(
+            self,
+            Self::Exited {
+                code: 0,
+                signal: None
+            }
+        )
+    }
+}
+
 pub fn run(
-    commands: Vec<String>,
+    commands: Vec<CommandSpec>,
     color: ColorMode,
     terminal_size: TerminalSize,
     sender: Sender<Event>,
     cancel: Arc<AtomicBool>,
 ) {
-    for (index, command_line) in commands.into_iter().enumerate() {
+    let command_count = commands.len();
+    for (index, command_spec) in commands.into_iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -81,6 +113,10 @@ pub fn run(
             Ok(pair) => pair,
             Err(error) => {
                 send_spawn_failure(&sender, index, started_at, error.to_string());
+                if command_spec.required {
+                    send_skipped(&sender, index, command_count);
+                    break;
+                }
                 continue;
             }
         };
@@ -89,16 +125,24 @@ pub fn run(
             Ok(reader) => reader,
             Err(error) => {
                 send_spawn_failure(&sender, index, started_at, error.to_string());
+                if command_spec.required {
+                    send_skipped(&sender, index, command_count);
+                    break;
+                }
                 continue;
             }
         };
 
-        let mut command = shell_command(&command_line);
+        let mut command = shell_command(&command_spec.command);
         configure_color(&mut command, color);
         let mut child = match pair.slave.spawn_command(command) {
             Ok(child) => child,
             Err(error) => {
                 send_spawn_failure(&sender, index, started_at, error.to_string());
+                if command_spec.required {
+                    send_skipped(&sender, index, command_count);
+                    break;
+                }
                 continue;
             }
         };
@@ -137,6 +181,7 @@ pub fn run(
             CommandResult::SpawnFailed("could not read the command's exit status".into())
         };
 
+        let stop_queue = command_spec.required && result.is_failure();
         let _ = sender.send(Event::Finished {
             index,
             result,
@@ -144,6 +189,10 @@ pub fn run(
         });
 
         if was_cancelled {
+            break;
+        }
+        if stop_queue {
+            send_skipped(&sender, index, command_count);
             break;
         }
     }
@@ -172,6 +221,12 @@ fn suppress_input_echo(master: &dyn portable_pty::MasterPty) {
 
 #[cfg(windows)]
 fn suppress_input_echo(_master: &dyn portable_pty::MasterPty) {}
+
+fn send_skipped(sender: &Sender<Event>, blocked_by: usize, command_count: usize) {
+    for index in (blocked_by + 1)..command_count {
+        let _ = sender.send(Event::Skipped { index, blocked_by });
+    }
+}
 
 fn send_spawn_failure(sender: &Sender<Event>, index: usize, started_at: Instant, error: String) {
     let _ = sender.send(Event::Finished {
@@ -296,7 +351,10 @@ mod tests {
     fn runs_commands_in_order_and_captures_output() {
         let (sender, receiver) = mpsc::channel();
         run(
-            vec!["printf first".into(), "printf second".into()],
+            vec![
+                CommandSpec::required("printf first"),
+                CommandSpec::required("printf second"),
+            ],
             ColorMode::Auto,
             TEST_TERMINAL,
             sender,
@@ -333,10 +391,66 @@ mod tests {
     }
 
     #[test]
+    fn required_failure_skips_the_remaining_queue() {
+        let (sender, receiver) = mpsc::channel();
+        run(
+            vec![
+                CommandSpec::required("exit 7"),
+                CommandSpec::required("printf never"),
+            ],
+            ColorMode::Auto,
+            TEST_TERMINAL,
+            sender,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let events = receiver.into_iter().collect::<Vec<_>>();
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Event::Started { index: 0 },
+                Event::Finished { index: 0, .. },
+                Event::Skipped {
+                    index: 1,
+                    blocked_by: 0
+                },
+                Event::AllFinished { cancelled: false }
+            ]
+        ));
+    }
+
+    #[test]
+    fn optional_failure_allows_the_queue_to_continue() {
+        let (sender, receiver) = mpsc::channel();
+        run(
+            vec![
+                CommandSpec {
+                    command: "exit 7".into(),
+                    required: false,
+                },
+                CommandSpec::required("printf continued"),
+            ],
+            ColorMode::Auto,
+            TEST_TERMINAL,
+            sender,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let starts = receiver
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Started { index } => Some(index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(starts, [0, 1]);
+    }
+
+    #[test]
     fn child_detects_a_terminal() {
         let (sender, receiver) = mpsc::channel();
         run(
-            vec!["if [ -t 2 ]; then printf tty; fi".into()],
+            vec![CommandSpec::required("if [ -t 2 ]; then printf tty; fi")],
             ColorMode::Auto,
             TEST_TERMINAL,
             sender,
@@ -361,7 +475,10 @@ mod tests {
         let started_at = Instant::now();
         let worker = thread::spawn(move || {
             run(
-                vec!["sleep 3 & printf first".into(), "printf second".into()],
+                vec![
+                    CommandSpec::required("sleep 3 & printf first"),
+                    CommandSpec::required("printf second"),
+                ],
                 ColorMode::Auto,
                 TEST_TERMINAL,
                 sender,
@@ -394,7 +511,7 @@ mod tests {
         let worker_cancel = Arc::clone(&cancel);
         let worker = thread::spawn(move || {
             run(
-                vec![long_running_command().into()],
+                vec![CommandSpec::required(long_running_command())],
                 ColorMode::Auto,
                 TEST_TERMINAL,
                 sender,

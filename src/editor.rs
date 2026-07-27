@@ -14,11 +14,14 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph},
 };
 
+use crate::runner::CommandSpec;
+
 const CYAN: Color = Color::Rgb(0, 229, 255);
 const BLUE: Color = Color::Rgb(90, 140, 255);
 const MAGENTA: Color = Color::Rgb(255, 73, 219);
 const GREEN: Color = Color::Rgb(73, 232, 151);
 const RED: Color = Color::Rgb(255, 91, 112);
+const YELLOW: Color = Color::Rgb(245, 200, 66);
 const MUTED: Color = Color::Rgb(113, 121, 140);
 const PANEL: Color = Color::Rgb(35, 39, 51);
 const BACKGROUND: Color = Color::Rgb(15, 17, 23);
@@ -37,7 +40,7 @@ const LOGO: [[&str; 5]; 8] = [
 pub fn review(
     terminal: &mut DefaultTerminal,
     initial_commands: Vec<String>,
-) -> io::Result<Option<Vec<String>>> {
+) -> io::Result<Option<Vec<CommandSpec>>> {
     let mut pending_event = play_intro(terminal)?;
 
     let starts_empty = initial_commands.is_empty();
@@ -157,7 +160,7 @@ fn render_intro(frame: &mut Frame, elapsed: Duration, duration: Duration) {
 }
 
 struct CommandEditor {
-    commands: Vec<String>,
+    commands: Vec<CommandSpec>,
     selected: usize,
     editing: Option<EditState>,
     prompt: EditorPrompt,
@@ -184,9 +187,13 @@ enum EditorAction {
 }
 
 impl CommandEditor {
-    fn new(mut commands: Vec<String>) -> Self {
+    fn new(commands: Vec<String>) -> Self {
+        let mut commands = commands
+            .into_iter()
+            .map(CommandSpec::required)
+            .collect::<Vec<_>>();
         if commands.is_empty() {
-            commands.push(String::new());
+            commands.push(CommandSpec::required(""));
         }
         Self {
             commands,
@@ -209,6 +216,7 @@ impl CommandEditor {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.prompt = EditorPrompt::Quit,
             KeyCode::Char('r') => self.request_run(),
+            KeyCode::Char(' ') => self.toggle_required(),
             KeyCode::Enter | KeyCode::Char('e') => self.begin_edit(),
             KeyCode::Char('a' | 'o') => self.add_command(),
             KeyCode::Char('d') | KeyCode::Delete => self.delete_command(),
@@ -244,31 +252,36 @@ impl CommandEditor {
                 self.message = None;
             }
             KeyCode::Esc => {
-                self.commands[self.selected] = edit.original.clone();
+                self.commands[self.selected].command = edit.original.clone();
                 self.editing = None;
             }
             KeyCode::Left => edit.cursor = edit.cursor.saturating_sub(1),
             KeyCode::Right => {
-                edit.cursor = (edit.cursor + 1).min(self.commands[self.selected].chars().count());
+                edit.cursor =
+                    (edit.cursor + 1).min(self.commands[self.selected].command.chars().count());
             }
             KeyCode::Home => edit.cursor = 0,
-            KeyCode::End => edit.cursor = self.commands[self.selected].chars().count(),
+            KeyCode::End => {
+                edit.cursor = self.commands[self.selected].command.chars().count();
+            }
             KeyCode::Backspace if edit.cursor > 0 => {
-                let start = byte_index(&self.commands[self.selected], edit.cursor - 1);
-                let end = byte_index(&self.commands[self.selected], edit.cursor);
-                self.commands[self.selected].replace_range(start..end, "");
+                let command = &mut self.commands[self.selected].command;
+                let start = byte_index(command, edit.cursor - 1);
+                let end = byte_index(command, edit.cursor);
+                command.replace_range(start..end, "");
                 edit.cursor -= 1;
             }
             KeyCode::Delete => {
-                let length = self.commands[self.selected].chars().count();
+                let command = &mut self.commands[self.selected].command;
+                let length = command.chars().count();
                 if edit.cursor < length {
-                    let start = byte_index(&self.commands[self.selected], edit.cursor);
-                    let end = byte_index(&self.commands[self.selected], edit.cursor + 1);
-                    self.commands[self.selected].replace_range(start..end, "");
+                    let start = byte_index(command, edit.cursor);
+                    let end = byte_index(command, edit.cursor + 1);
+                    command.replace_range(start..end, "");
                 }
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.commands[self.selected].clear();
+                self.commands[self.selected].command.clear();
                 edit.cursor = 0;
             }
             KeyCode::Char(character)
@@ -276,8 +289,9 @@ impl CommandEditor {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                let index = byte_index(&self.commands[self.selected], edit.cursor);
-                self.commands[self.selected].insert(index, character);
+                let command = &mut self.commands[self.selected].command;
+                let index = byte_index(command, edit.cursor);
+                command.insert(index, character);
                 edit.cursor += 1;
             }
             _ => {}
@@ -289,13 +303,14 @@ impl CommandEditor {
             return;
         };
         let pasted = text.replace(['\r', '\n'], " ");
-        let index = byte_index(&self.commands[self.selected], edit.cursor);
-        self.commands[self.selected].insert_str(index, &pasted);
+        let command = &mut self.commands[self.selected].command;
+        let index = byte_index(command, edit.cursor);
+        command.insert_str(index, &pasted);
         edit.cursor += pasted.chars().count();
     }
 
     fn begin_edit(&mut self) {
-        let command = &self.commands[self.selected];
+        let command = &self.commands[self.selected].command;
         self.editing = Some(EditState {
             original: command.clone(),
             cursor: command.chars().count(),
@@ -305,16 +320,22 @@ impl CommandEditor {
 
     fn add_command(&mut self) {
         self.selected += 1;
-        self.commands.insert(self.selected, String::new());
+        self.commands
+            .insert(self.selected, CommandSpec::required(""));
         self.begin_edit();
     }
 
     fn delete_command(&mut self) {
         self.commands.remove(self.selected);
         if self.commands.is_empty() {
-            self.commands.push(String::new());
+            self.commands.push(CommandSpec::required(""));
         }
         self.selected = self.selected.min(self.commands.len() - 1);
+        self.message = None;
+    }
+
+    fn toggle_required(&mut self) {
+        self.commands[self.selected].required = !self.commands[self.selected].required;
         self.message = None;
     }
 
@@ -349,12 +370,16 @@ impl CommandEditor {
         }
     }
 
-    fn commands_for_run(&self) -> Vec<String> {
+    fn commands_for_run(&self) -> Vec<CommandSpec> {
         self.commands
             .iter()
-            .map(|command| command.trim())
-            .filter(|command| !command.is_empty())
-            .map(str::to_owned)
+            .filter_map(|command| {
+                let text = command.command.trim();
+                (!text.is_empty()).then(|| CommandSpec {
+                    command: text.to_owned(),
+                    required: command.required,
+                })
+            })
             .collect()
     }
 
@@ -388,7 +413,7 @@ impl CommandEditor {
                     Span::styled("  COMMAND QUEUE", Style::new().fg(CYAN).bold()),
                 ]),
                 Line::styled(
-                    "Review and edit every command before anything runs.",
+                    "Required commands stop the queue on failure; Space toggles the selection.",
                     Style::new().fg(MUTED),
                 ),
             ])
@@ -428,8 +453,9 @@ impl CommandEditor {
         );
     }
 
-    fn command_line(&self, index: usize, command: &str) -> Line<'static> {
+    fn command_line(&self, index: usize, command: &CommandSpec) -> Line<'static> {
         let selected = index == self.selected;
+        let text = command.command.as_str();
         let row_style = if selected {
             Style::new().bg(PANEL)
         } else {
@@ -441,26 +467,36 @@ impl CommandEditor {
                 row_style.fg(CYAN).bold(),
             ),
             Span::styled(format!("{:02}  ", index + 1), row_style.fg(MUTED)),
+            Span::styled(
+                if command.required {
+                    "[required] "
+                } else {
+                    "[optional] "
+                },
+                row_style
+                    .fg(if command.required { GREEN } else { YELLOW })
+                    .bold(),
+            ),
         ];
 
         if selected && let Some(edit) = &self.editing {
-            let cursor_byte = byte_index(command, edit.cursor);
+            let cursor_byte = byte_index(text, edit.cursor);
             spans.push(Span::styled(
-                command[..cursor_byte].to_owned(),
+                text[..cursor_byte].to_owned(),
                 row_style.fg(Color::White),
             ));
             spans.push(Span::styled("█", row_style.fg(MAGENTA).bold()));
             spans.push(Span::styled(
-                command[cursor_byte..].to_owned(),
+                text[cursor_byte..].to_owned(),
                 row_style.fg(Color::White),
             ));
-        } else if command.is_empty() {
+        } else if text.is_empty() {
             spans.push(Span::styled(
                 "<empty command>",
                 row_style.fg(MUTED).italic(),
             ));
         } else {
-            spans.push(Span::styled(command.to_owned(), row_style.fg(Color::White)));
+            spans.push(Span::styled(text.to_owned(), row_style.fg(Color::White)));
         }
         Line::from(spans).style(row_style)
     }
@@ -486,7 +522,9 @@ impl CommandEditor {
         } else {
             vec![
                 Line::from(vec![
-                    " Enter/e ".black().on_cyan().bold(),
+                    " Space ".black().on_magenta().bold(),
+                    " required  ".fg(MUTED),
+                    "Enter/e ".black().on_cyan().bold(),
                     " edit  ".fg(MUTED),
                     "a ".fg(CYAN).bold(),
                     " add  ".fg(MUTED),
@@ -524,14 +562,18 @@ impl CommandEditor {
             height,
         );
         let (title, question, yes) = match self.prompt {
-            EditorPrompt::Run => (
-                " RUN COMMANDS ",
-                format!(
-                    "Run {} commands sequentially?",
-                    self.commands_for_run().len()
-                ),
-                " run",
-            ),
+            EditorPrompt::Run => {
+                let commands = self.commands_for_run();
+                let required = commands.iter().filter(|command| command.required).count();
+                (
+                    " RUN COMMANDS ",
+                    format!(
+                        "Run {} commands sequentially ({required} required)?",
+                        commands.len()
+                    ),
+                    " run",
+                )
+            }
             EditorPrompt::Quit => (
                 " DISCARD QUEUE ",
                 "Quit without running these commands?".into(),
@@ -583,10 +625,19 @@ fn byte_index(value: &str, char_index: usize) -> usize {
 mod tests {
     use super::*;
 
+    fn command_texts(editor: &CommandEditor) -> Vec<&str> {
+        editor
+            .commands
+            .iter()
+            .map(|command| command.command.as_str())
+            .collect()
+    }
+
     #[test]
     fn empty_editor_starts_with_one_editable_row() {
         let editor = CommandEditor::new(Vec::new());
-        assert_eq!(editor.commands, [""]);
+        assert_eq!(command_texts(&editor), [""]);
+        assert!(editor.commands[0].required);
         assert!(editor.commands_for_run().is_empty());
     }
 
@@ -596,12 +647,12 @@ mod tests {
         editor.add_command();
         editor.handle_paste("third");
         editor.handle_edit_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(editor.commands, ["first", "third", "second"]);
+        assert_eq!(command_texts(&editor), ["first", "third", "second"]);
 
         editor.move_down();
-        assert_eq!(editor.commands, ["first", "second", "third"]);
+        assert_eq!(command_texts(&editor), ["first", "second", "third"]);
         editor.delete_command();
-        assert_eq!(editor.commands, ["first", "second"]);
+        assert_eq!(command_texts(&editor), ["first", "second"]);
     }
 
     #[test]
@@ -609,7 +660,17 @@ mod tests {
         let mut editor = CommandEditor::new(vec!["echo 🦀".into()]);
         editor.begin_edit();
         editor.handle_edit_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(editor.commands, ["echo "]);
+        assert_eq!(command_texts(&editor), ["echo "]);
+    }
+
+    #[test]
+    fn commands_are_required_by_default_and_can_be_toggled() {
+        let mut editor = CommandEditor::new(vec!["build".into()]);
+        assert!(editor.commands[0].required);
+
+        editor.toggle_required();
+        assert!(!editor.commands[0].required);
+        assert!(!editor.commands_for_run()[0].required);
     }
 
     #[test]

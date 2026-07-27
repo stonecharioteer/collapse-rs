@@ -68,14 +68,15 @@ collapse --color auto 'git status' 'git log --oneline --decorate -20'
 collapse
 ```
 
-Color output is forced by default because child output is captured through pipes and many tools otherwise disable styling. Tools with their own color policy may still need an explicit flag such as `--color=always`.
+Color output is forced by default for consistent styling across tools. Tools with their own color policy may still need an explicit flag such as `--color=always`.
 
-Commands run even if an earlier command fails, making it possible to review every result at the end. Commands are non-interactive: `collapse` owns terminal input for navigation and gives child commands an empty stdin.
+Commands are required by default. If a required command fails, the remaining queue is marked skipped. Press `Space` in the editor to make a command optional; optional failures are shown as warnings, do not stop the queue, and do not make the overall run fail. Commands are non-interactive: `collapse` owns terminal input for navigation and gives child commands an empty stdin.
 
 ## Command editor keys
 
 | Key                  | Action                               |
 | -------------------- | ------------------------------------ |
+| `Space`              | Toggle required/optional             |
 | `Enter`, `e`         | Edit the selected command            |
 | `a`, `o`             | Add and edit a command               |
 | `d`, `Delete`        | Delete the selected command          |
@@ -103,7 +104,7 @@ While editing, use `Enter` to save, `Esc` to cancel, arrow keys to move the curs
 | `y`                      | Confirm quitting and cancel remaining commands   |
 | `n`, `Esc`, `Enter`      | Dismiss quit confirmation                        |
 
-`collapse` exits with status 1 if any command fails and 130 if execution is cancelled.
+`collapse` exits with status 1 if a required command fails and 130 if execution is cancelled. Optional failures do not change the exit status.
 
 ## Development
 

@@ -21,12 +21,13 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Gauge, Padding, Paragraph, Tabs},
 };
 
-use crate::runner::{self, ColorMode, CommandResult, Event, TerminalSize};
+use crate::runner::{self, ColorMode, CommandResult, CommandSpec, Event, TerminalSize};
 
 const CYAN: Color = Color::Rgb(0, 229, 255);
 const MAGENTA: Color = Color::Rgb(255, 73, 219);
 const GREEN: Color = Color::Rgb(73, 232, 151);
 const RED: Color = Color::Rgb(255, 91, 112);
+const YELLOW: Color = Color::Rgb(245, 200, 66);
 const MUTED: Color = Color::Rgb(113, 121, 140);
 const PANEL: Color = Color::Rgb(35, 39, 51);
 
@@ -88,7 +89,7 @@ pub fn run(
 
     if interrupted || app.cancelled {
         Ok(130)
-    } else if app.tasks.iter().any(|task| task.status.is_failure()) {
+    } else if app.has_required_failure() {
         Ok(1)
     } else {
         Ok(0)
@@ -111,7 +112,7 @@ struct App {
 }
 
 impl App {
-    fn new(commands: Vec<String>, terminal_size: TerminalSize) -> Self {
+    fn new(commands: Vec<CommandSpec>, terminal_size: TerminalSize) -> Self {
         Self {
             tasks: commands
                 .into_iter()
@@ -129,6 +130,12 @@ impl App {
             current_match: None,
             quit_confirmation: false,
         }
+    }
+
+    fn has_required_failure(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|task| task.required && task.status.is_failure())
     }
 
     fn receive(&mut self, receiver: &Receiver<Event>) {
@@ -178,6 +185,18 @@ impl App {
                                 TaskStatus::SpawnFailed
                             }
                         };
+                    }
+                }
+                Event::Skipped { index, blocked_by } => {
+                    if let Some(task) = self.tasks.get_mut(index) {
+                        task.status = TaskStatus::Skipped;
+                        task.push_output(
+                            format!(
+                                "\x1b[33mSkipped: required command {} failed.\x1b[0m\n",
+                                blocked_by + 1
+                            )
+                            .as_bytes(),
+                        );
                     }
                 }
                 Event::AllFinished { cancelled } => {
@@ -385,22 +404,36 @@ impl App {
             .iter()
             .filter(|task| matches!(task.status, TaskStatus::Passed))
             .count();
-        let failed = self
+        let required_failed = self
             .tasks
             .iter()
-            .filter(|task| task.status.is_failure())
+            .filter(|task| task.required && task.status.is_failure())
+            .count();
+        let optional_failed = self
+            .tasks
+            .iter()
+            .filter(|task| !task.required && task.status.is_failure())
+            .count();
+        let skipped = self
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.status, TaskStatus::Skipped))
             .count();
         let spinner = ["◆", "◇", "◈", "◇"][self.tick % 4];
-        let state = if self.all_finished && failed == 0 {
-            Span::styled("DONE", Style::new().fg(GREEN).bold())
-        } else if self.all_finished {
+        let state = if self.all_finished && required_failed > 0 {
             Span::styled("FAILED", Style::new().fg(RED).bold())
+        } else if self.all_finished && optional_failed > 0 {
+            Span::styled("WARNINGS", Style::new().fg(YELLOW).bold())
+        } else if self.all_finished {
+            Span::styled("DONE", Style::new().fg(GREEN).bold())
         } else {
             Span::styled(format!("{spinner} RUNNING"), Style::new().fg(CYAN).bold())
         };
         let elapsed = format_duration(self.started_at.elapsed());
         let summary = if self.all_finished {
-            format!("  {passed} passed  {failed} failed  {elapsed}")
+            format!(
+                "  {passed} passed  {required_failed} failed  {optional_failed} optional  {skipped} skipped  {elapsed}"
+            )
         } else {
             format!("  {complete}/{} tasks  {elapsed}", self.tasks.len())
         };
@@ -434,7 +467,11 @@ impl App {
             .iter()
             .enumerate()
             .map(|(index, task)| {
-                let marker = task.status.marker(self.tick);
+                let marker = if !task.required && task.status.is_failure() {
+                    "!"
+                } else {
+                    task.status.marker(self.tick)
+                };
                 Line::from(format!(" {marker} {} ", short_name(&task.command, index)))
             })
             .collect();
@@ -475,16 +512,32 @@ impl App {
         }
 
         let status = task.status.label(task.elapsed_or_running());
+        let status_style = if !task.required && task.status.is_failure() {
+            Style::new().fg(YELLOW).bold()
+        } else {
+            task.status.style()
+        };
+        let failure_color = if task.required { RED } else { YELLOW };
         let title = Line::from(vec![
             Span::styled(
                 format!(" TASK {}/{} ", self.selected + 1, task_count),
                 Style::new().fg(Color::Black).bg(MAGENTA).bold(),
             ),
             Span::styled(
+                if task.required {
+                    " REQUIRED "
+                } else {
+                    " OPTIONAL "
+                },
+                Style::new()
+                    .fg(if task.required { GREEN } else { YELLOW })
+                    .bold(),
+            ),
+            Span::styled(
                 format!(" {} ", task.command),
                 Style::new().fg(Color::White).bold(),
             ),
-            Span::styled(format!(" · {status} "), task.status.style()),
+            Span::styled(format!(" · {status} "), status_style),
             if search_query.is_empty() {
                 Span::raw("")
             } else {
@@ -499,7 +552,11 @@ impl App {
             .title(title)
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(if task.status.is_failure() { RED } else { PANEL }))
+            .border_style(Style::new().fg(if task.status.is_failure() {
+                failure_color
+            } else {
+                PANEL
+            }))
             .padding(Padding::horizontal(1));
 
         let content = if task.rendered.lines.is_empty() {
@@ -776,6 +833,7 @@ fn line_is_blank(line: &Line<'_>) -> bool {
 
 struct Task {
     command: String,
+    required: bool,
     status: TaskStatus,
     started_at: Option<Instant>,
     elapsed: Option<Duration>,
@@ -787,9 +845,10 @@ struct Task {
 }
 
 impl Task {
-    fn new(command: String, terminal_size: TerminalSize) -> Self {
+    fn new(command: CommandSpec, terminal_size: TerminalSize) -> Self {
         Self {
-            command,
+            command: command.command,
+            required: command.required,
             status: TaskStatus::Queued,
             started_at: None,
             elapsed: None,
@@ -831,6 +890,7 @@ enum TaskStatus {
     Passed,
     Failed(Option<i32>),
     SpawnFailed,
+    Skipped,
     Cancelled,
 }
 
@@ -849,6 +909,7 @@ impl TaskStatus {
             Self::Running => ["◐", "◓", "◑", "◒"][tick % 4],
             Self::Passed => "✓",
             Self::Failed(_) | Self::SpawnFailed => "✕",
+            Self::Skipped => "–",
             Self::Cancelled => "■",
         }
     }
@@ -859,6 +920,7 @@ impl TaskStatus {
             Self::Running => Style::new().fg(CYAN).bold(),
             Self::Passed => Style::new().fg(GREEN).bold(),
             Self::Failed(_) | Self::SpawnFailed => Style::new().fg(RED).bold(),
+            Self::Skipped => Style::new().fg(MUTED).bold(),
             Self::Cancelled => Style::new().fg(MAGENTA).bold(),
         }
     }
@@ -872,6 +934,7 @@ impl TaskStatus {
             Self::Failed(Some(code)) => format!("FAILED ({code}) {duration}"),
             Self::Failed(None) => format!("FAILED (signal) {duration}"),
             Self::SpawnFailed => format!("SPAWN FAILED {duration}"),
+            Self::Skipped => "SKIPPED".into(),
             Self::Cancelled => format!("CANCELLED {duration}"),
         }
     }
@@ -915,7 +978,7 @@ mod tests {
 
     #[test]
     fn ansi_output_keeps_truecolor() {
-        let mut task = Task::new("colors".into(), TEST_TERMINAL);
+        let mut task = Task::new(CommandSpec::required("colors"), TEST_TERMINAL);
         task.push_output(b"\x1b[38;2;12;34;56mhello\x1b[0m\n");
         task.refresh_output();
 
@@ -928,7 +991,7 @@ mod tests {
 
     #[test]
     fn terminal_output_rewrites_progress_in_place() {
-        let mut task = Task::new("progress".into(), TEST_TERMINAL);
+        let mut task = Task::new(CommandSpec::required("progress"), TEST_TERMINAL);
         task.push_output(b"progress 0/2");
         task.push_output(b"\r\x1b[2Kprogress 1/2");
         task.refresh_output();
@@ -944,7 +1007,7 @@ mod tests {
     #[test]
     fn terminal_scrollback_is_kept() {
         let size = TerminalSize { rows: 3, cols: 40 };
-        let mut task = Task::new("lines".into(), size);
+        let mut task = Task::new(CommandSpec::required("lines"), size);
         task.push_output(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         task.refresh_output();
 
@@ -980,7 +1043,7 @@ mod tests {
 
     #[test]
     fn next_match_wraps_around() {
-        let mut app = App::new(vec!["search".into()], TEST_TERMINAL);
+        let mut app = App::new(vec![CommandSpec::required("search")], TEST_TERMINAL);
         app.tasks[0].rendered = Text::from("needle\nother\nneedle");
         app.search_query = "needle".into();
         app.select_initial_match();
@@ -994,7 +1057,7 @@ mod tests {
 
     #[test]
     fn quitting_requires_confirmation() {
-        let mut app = App::new(vec!["work".into()], TEST_TERMINAL);
+        let mut app = App::new(vec![CommandSpec::required("work")], TEST_TERMINAL);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE,)));
         assert!(app.quit_confirmation);
 
@@ -1003,6 +1066,18 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE,)));
+    }
+
+    #[test]
+    fn only_required_failures_fail_the_run() {
+        let mut optional = CommandSpec::required("optional");
+        optional.required = false;
+        let mut app = App::new(vec![optional], TEST_TERMINAL);
+        app.tasks[0].status = TaskStatus::Failed(Some(1));
+        assert!(!app.has_required_failure());
+
+        app.tasks[0].required = true;
+        assert!(app.has_required_failure());
     }
 
     #[test]
